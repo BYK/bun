@@ -628,6 +628,12 @@ pub fn unhandledRejection(this: *jsc.VirtualMachine, globalObject: *JSGlobalObje
             };
             const wrapped_reason = wrapUnhandledRejectionErrorForUncaughtException(globalObject, reason);
             _ = this.uncaughtException(globalObject, wrapped_reason, true);
+            // Worker `error` listener called preventDefault(): already handled.
+            // Skip process.on('unhandledRejection') dispatch and the warning.
+            // Clear the flag since we're consuming it — if Bun__handleUncaughtException
+            // handled a later error internally (no onUnhandledRejection → no entry-reset),
+            // a stale `true` here would wrongly skip that later error's dispatch.
+            if (this.takeWorkerErrorEventPrevented()) return;
             if (Bun__handleUnhandledRejection(globalObject, reason, promise) > 0) return;
             jsc.fromJSHostCallGeneric(globalObject, @src(), Bun__promises__emitUnhandledRejectionWarning, .{ globalObject, reason, promise }) catch |err| {
                 _ = globalObject.reportUncaughtException(globalObject.takeException(err).asException(globalObject.vm()).?);
@@ -690,14 +696,39 @@ pub fn uncaughtException(this: *jsc.VirtualMachine, globalObject: *JSGlobalObjec
     }
     this.is_handling_uncaught_exception = true;
     defer this.is_handling_uncaught_exception = false;
-    const handled = Bun__handleUncaughtException(globalObject, err.toError() orelse err, if (is_rejection) 1 else 0) > 0;
+    var handled = Bun__handleUncaughtException(globalObject, err.toError() orelse err, if (is_rejection) 1 else 0) > 0;
     if (!handled) {
         // TODO maybe we want a separate code path for uncaught exceptions
         this.unhandled_error_counter += 1;
+        const prev_exit_code = this.exit_handler.exit_code;
         this.exit_handler.exit_code = 1;
         this.onUnhandledRejection(this, globalObject, err);
+        // Worker `error` listener called preventDefault() (see web_worker.zig).
+        // Mark handled so the `.throw` caller's guard early-returns. Restore the
+        // pre-error exit code only if still our sentinel 1 — don't clobber a new
+        // exitCode set inside the handler.
+        if (this.workerErrorEventPrevented()) {
+            handled = true;
+            if (this.exit_handler.exit_code == 1) this.exit_handler.exit_code = prev_exit_code;
+        }
     }
     return handled;
+}
+
+fn workerErrorEventPrevented(this: *const jsc.VirtualMachine) bool {
+    return if (this.worker) |w| w.error_event_prevented else false;
+}
+
+/// Read-and-clear. Use at guard sites where a stale `true` could affect a
+/// later error dispatch that bypasses `onUnhandledRejection`'s entry-reset
+/// (e.g. when `Bun__handleUncaughtException` returns > 0 for the later error).
+fn takeWorkerErrorEventPrevented(this: *jsc.VirtualMachine) bool {
+    if (this.worker) |w| {
+        const prev = w.error_event_prevented;
+        w.error_event_prevented = false;
+        return prev;
+    }
+    return false;
 }
 
 pub fn reportExceptionInHotReloadedModuleIfNeeded(this: *jsc.VirtualMachine) void {

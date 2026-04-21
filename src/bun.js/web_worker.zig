@@ -134,6 +134,10 @@ execArgv: ?[]const WTFStringImpl,
 /// Used to distinguish between terminate() called by exit(), and terminate() called for other reasons
 exit_called: bool = false,
 
+/// Set when the worker's `error` listener called preventDefault().
+/// Callers skip termination and keep the worker running.
+error_event_prevented: bool = false,
+
 pub const Status = enum(u8) {
     start,
     starting,
@@ -145,7 +149,7 @@ extern fn WebWorker__teardownJSCVM(*jsc.JSGlobalObject) void;
 extern fn WebWorker__dispatchExit(*anyopaque, i32) void;
 extern fn WebWorker__dispatchOnline(cpp_worker: *anyopaque, *jsc.JSGlobalObject) void;
 extern fn WebWorker__fireEarlyMessages(cpp_worker: *anyopaque, *jsc.JSGlobalObject) void;
-extern fn WebWorker__dispatchError(*jsc.JSGlobalObject, *anyopaque, bun.String, JSValue) void;
+extern fn WebWorker__dispatchError(*jsc.JSGlobalObject, *anyopaque, bun.String, JSValue) bool;
 
 export fn WebWorker__getParentWorker(vm: *jsc.VirtualMachine) ?*anyopaque {
     const worker = vm.worker orelse return null;
@@ -481,7 +485,7 @@ pub fn start(
         // null (we only assign it below). Free the moved-in proxy storage
         // explicitly so the cloned RefCountedEnvValue refs aren't leaked.
         vm.proxy_env_storage.deinit();
-        this.flushLogs();
+        _ = this.flushLogs();
         this.exitAndDeinit();
         return;
     };
@@ -523,10 +527,12 @@ pub fn destroy(this: *WebWorker) callconv(.c) void {
     bun.default_allocator.destroy(this);
 }
 
-fn flushLogs(this: *WebWorker) void {
+/// Returns `true` if the dispatched `error` was cancelled via preventDefault();
+/// callers must skip `exitAndDeinit` in that case.
+fn flushLogs(this: *WebWorker) bool {
     jsc.markBinding(@src());
-    var vm = this.vm orelse return;
-    if (vm.log.msgs.items.len == 0) return;
+    var vm = this.vm orelse return false;
+    if (vm.log.msgs.items.len == 0) return false;
     const err, const str = blk: {
         const err = vm.log.toJS(vm.global, bun.default_allocator, "Error in worker") catch |e|
             break :blk e;
@@ -539,14 +545,26 @@ fn flushLogs(this: *WebWorker) void {
         error.JSTerminated => @panic("unhandled exception"),
     };
     defer str.deref();
-    bun.jsc.fromJSHostCallGeneric(vm.global, @src(), WebWorker__dispatchError, .{ vm.global, this.cpp_worker, str, err }) catch |e| {
+    const prevented = bun.jsc.fromJSHostCallGeneric(vm.global, @src(), WebWorker__dispatchError, .{ vm.global, this.cpp_worker, str, err }) catch |e| {
         _ = vm.global.reportUncaughtException(vm.global.takeException(e).asException(vm.global.vm()).?);
+        // Clear here too — `reportUncaughtException` doesn't read `vm.log`, and
+        // leaving `msgs` non-empty would cause a later `flushLogs()` call to
+        // re-dispatch the same error event (possibly without the listener
+        // cancelling it the second time).
+        vm.log.reset();
+        return false;
     };
+    // `Log.toJS` doesn't clear `msgs`; reset to avoid re-dispatch if called again.
+    vm.log.reset();
+    return prevented;
 }
 
 fn onUnhandledRejection(vm: *jsc.VirtualMachine, globalObject: *jsc.JSGlobalObject, error_instance_or_exception: jsc.JSValue) void {
     // Prevent recursion
     vm.onUnhandledRejection = &jsc.VirtualMachine.onQuietUnhandledRejectionHandlerCaptureValue;
+
+    // Reset so callers see a fresh value, not a stale `true` from a prior dispatch.
+    if (vm.worker) |w| w.error_event_prevented = false;
 
     var error_instance = error_instance_or_exception.toError() orelse error_instance_or_exception;
 
@@ -582,7 +600,40 @@ fn onUnhandledRejection(vm: *jsc.VirtualMachine, globalObject: *jsc.JSGlobalObje
         bun.outOfMemory();
     };
     jsc.markBinding(@src());
-    WebWorker__dispatchError(globalObject, worker.cpp_worker, bun.String.cloneUTF8(array.written()), error_instance);
+    // Keep the BunString alive until after dispatch; the prevented path keeps
+    // the worker running, so it must be released explicitly rather than leaked.
+    const message_str = bun.String.cloneUTF8(array.written());
+    defer message_str.deref();
+    // Snapshot counter + exit_code before dispatch.
+    //
+    // Counter: restore to `snapshot - 1` on prevent, undoing the caller's
+    // `+= 1` AND any re-entrant increments (e.g. listener preventDefaults
+    // AND throws → `reportException` → re-entrant `uncaughtException` bumps
+    // the counter further).
+    //
+    // Exit code: some call sites (e.g. `unhandledRejection`'s `.bun` mode at
+    // VirtualMachine.zig:663) invoke `onUnhandledRejection` DIRECTLY without
+    // going through `uncaughtException`, so there's no outer frame to roll
+    // back `exit_code`. If a listener-throw triggers a re-entrant
+    // `uncaughtException` that sets `exit_code = 1`, restore here on prevent
+    // so the worker exits cleanly instead of with code 1.
+    const counter_snapshot = vm.unhandled_error_counter;
+    const exit_code_snapshot = vm.exit_handler.exit_code;
+    const prevented = WebWorker__dispatchError(globalObject, worker.cpp_worker, message_str, error_instance);
+    if (prevented) {
+        // Listener cancelled the event: roll back state so the worker stays
+        // alive. Only restore `exit_code` if it's still our sentinel 1 — don't
+        // clobber an explicit `process.exitCode = N` the user set during
+        // dispatch. (The `uncaughtException` caller path does its own
+        // symmetric restore; this is a no-op there because `exit_code` is
+        // unchanged by the listener.)
+        worker.error_event_prevented = true;
+        vm.unhandled_error_counter = if (counter_snapshot > 0) counter_snapshot - 1 else 0;
+        if (vm.exit_handler.exit_code == 1) vm.exit_handler.exit_code = exit_code_snapshot;
+        vm.onUnhandledRejection = onUnhandledRejection;
+        _ = globalObject.tryTakeException();
+        return;
+    }
     if (vm.worker) |worker_| {
         _ = worker.setRequestedTerminate();
         worker_.exitAndDeinit();
@@ -606,13 +657,14 @@ fn spin(this: *WebWorker) void {
     var resolve_error = bun.String.empty;
     defer resolve_error.deref();
     const path = resolveEntryPointSpecifier(vm, this.unresolved_specifier, &resolve_error, vm.log) orelse {
+        // No JS has run yet, so no listener can cancel; flush and terminate.
         vm.exit_handler.exit_code = 1;
         if (vm.log.errors == 0 and !resolve_error.isEmpty()) {
             const err = resolve_error.toUTF8(bun.default_allocator);
             defer err.deinit();
             bun.handleOom(vm.log.addError(null, .Empty, err.slice()));
         }
-        this.flushLogs();
+        _ = this.flushLogs();
         this.exitAndDeinit();
         return;
     };
@@ -620,32 +672,44 @@ fn spin(this: *WebWorker) void {
 
     // If the worker is terminated before we even try to run any code, the exit code should be 0
     if (this.hasRequestedTerminate()) {
-        this.flushLogs();
+        _ = this.flushLogs();
         this.exitAndDeinit();
         return;
     }
 
-    var promise = vm.loadEntryPointForWebWorker(path) catch {
-        // If we called process.exit(), don't override the exit code
-        if (!this.exit_called) vm.exit_handler.exit_code = 1;
-        this.flushLogs();
-        this.exitAndDeinit();
-        return;
-    };
-
-    if (promise.status() == .rejected) {
-        const handled = vm.uncaughtException(vm.global, promise.result(), true);
-
-        if (!handled) {
-            vm.exit_handler.exit_code = 1;
+    evaluate_entry_point: {
+        var promise = vm.loadEntryPointForWebWorker(path) catch {
+            // Snapshot after preloads ran so we preserve any `process.exitCode` they set.
+            const prev_load_exit_code = vm.exit_handler.exit_code;
+            if (!this.exit_called) vm.exit_handler.exit_code = 1;
+            // A preload's `error` listener may cancel the dispatch; keep the worker
+            // alive in that case. Restore only our sentinel `1` — honor a new exitCode
+            // set by the listener itself.
+            if (this.flushLogs()) {
+                if (vm.exit_handler.exit_code == 1) vm.exit_handler.exit_code = prev_load_exit_code;
+                break :evaluate_entry_point;
+            }
             this.exitAndDeinit();
             return;
+        };
+
+        if (promise.status() == .rejected) {
+            const handled = vm.uncaughtException(vm.global, promise.result(), true);
+
+            // Cancelled: keep the worker running. Reset so later errors are re-evaluated.
+            if (this.error_event_prevented) {
+                this.error_event_prevented = false;
+            } else if (!handled) {
+                vm.exit_handler.exit_code = 1;
+                this.exitAndDeinit();
+                return;
+            }
+        } else {
+            _ = promise.result();
         }
-    } else {
-        _ = promise.result();
     }
 
-    this.flushLogs();
+    _ = this.flushLogs();
     log("[{d}] event loop start", .{this.execution_context_id});
     // TODO(@190n) call dispatchOnline earlier (basically as soon as spin() starts, before
     // we start running JS)
@@ -680,7 +744,7 @@ fn spin(this: *WebWorker) void {
         vm.onBeforeExit();
     }
 
-    this.flushLogs();
+    _ = this.flushLogs();
     this.exitAndDeinit();
     log("[{d}] spin done", .{this.execution_context_id});
 }
