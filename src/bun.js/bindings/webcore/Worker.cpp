@@ -488,8 +488,10 @@ bool Worker::dispatchExit(int32_t exitCode)
     // Set ClosingFlag and drain outstanding parent event loop refs atomically
     // under the mutex. postMessage checks ClosingFlag under the same mutex, so
     // after this block no new refs can be added — any in-flight tasks that
-    // haven't decremented the counter yet will see it as 0 and skip the unref.
-    uint32_t leakedRefs = 0;
+    // haven't decremented the counter yet will see it as <= 0 and skip the
+    // unref (fetch_sub underflows into negative territory, which is why the
+    // counter is signed).
+    int32_t leakedRefs = 0;
     {
         Locker lock(this->m_pendingTasksMutex);
         m_onlineClosingFlags.fetch_or(ClosingFlag);
@@ -500,7 +502,7 @@ bool Worker::dispatchExit(int32_t exitCode)
     }
 
     return ScriptExecutionContext::postTaskTo(ctx->identifier(), [exitCode, leakedRefs, protectedThis = Ref { *this }](ScriptExecutionContext& context) -> void {
-        for (uint32_t i = 0; i < leakedRefs; i++)
+        for (int32_t i = 0; i < leakedRefs; i++)
             context.unrefEventLoop();
 
         protectedThis->m_onlineClosingFlags = ClosingFlag;

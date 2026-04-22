@@ -121,8 +121,10 @@ private:
     // Number of outstanding parent event loop refs from Worker::postMessage
     // that haven't been balanced by the task's embedded unrefEventLoop yet.
     // dispatchExit drains this to unwind any in-flight refs from tasks that
-    // will never run (e.g., tasks dropped during VM teardown).
-    std::atomic<uint32_t> m_parentLoopRefs { 0 };
+    // will never run (e.g., tasks dropped during VM teardown). Signed so
+    // fetch_sub underflow goes negative — the "prev > 0" check in the task
+    // lambda stays correct even if multiple tasks run after dispatchExit.
+    std::atomic<int32_t> m_parentLoopRefs { 0 };
     const ScriptExecutionContextIdentifier m_clientIdentifier;
     void* impl_ { nullptr };
 };
