@@ -118,6 +118,11 @@ private:
     std::atomic<uint8_t> m_onlineClosingFlags { 0 };
     // Tracks TerminateRequestedFlag and TerminatedFlag
     std::atomic<uint8_t> m_terminationFlags { 0 };
+    // Number of outstanding parent event loop refs from Worker::postMessage
+    // that haven't been balanced by the task's embedded unrefEventLoop yet.
+    // dispatchExit drains this to unwind any in-flight refs from tasks that
+    // will never run (e.g., tasks dropped during VM teardown).
+    std::atomic<uint32_t> m_parentLoopRefs { 0 };
     const ScriptExecutionContextIdentifier m_clientIdentifier;
     void* impl_ { nullptr };
 };
