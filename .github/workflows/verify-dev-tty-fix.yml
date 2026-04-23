@@ -94,10 +94,10 @@ jobs:
           PATCHED_BUN: ${{ steps.locate-bun.outputs.bun }}
         run: |
           set +e
-          python3 <<PY
+          python3 <<'PY'
           import os, pty, sys, select, time
 
-          BUN = "$PATCHED_BUN"
+          BUN = os.environ["PATCHED_BUN"]
           os.makedirs("/tmp/repro", exist_ok=True)
           with open("/tmp/repro/child.js", "w") as f:
               f.write(
@@ -203,7 +203,9 @@ jobs:
         env:
           PATCHED_BUN: ${{ steps.locate-bun.outputs.bun }}
         run: |
-          "$PATCHED_BUN" run build:single
+          # sentry-cli's package.json uses `"build"` (not `build:single`)
+          # to invoke the single-target build via `script/build.ts --single`.
+          "$PATCHED_BUN" run build
           ls -la dist-bin/
           file dist-bin/sentry-darwin-arm64
 
