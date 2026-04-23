@@ -150,11 +150,13 @@ jobs:
         with:
           repository: getsentry/cli
           path: sentry-cli
-          # a38572ec is PR #835 (workaround deleted). Using this commit
-          # means the resulting binary has NO userland /dev/tty workaround
-          # — the only thing fixing the keystroke delivery would be the
-          # patched Bun runtime. Clean A/B test.
-          ref: a38572ec
+          # a38572ecf1d0e1c2b5f8be01e16eb1d767f3ddff is PR #835 (workaround
+          # deleted). Using this commit means the resulting binary has NO
+          # userland /dev/tty workaround — the only thing fixing the
+          # keystroke delivery would be the patched Bun runtime. Clean
+          # A/B test.
+          ref: a38572ecf1d0e1c2b5f8be01e16eb1d767f3ddff
+          fetch-depth: 0
 
       - name: Patch sentry-cli build script to use the patched Bun runtime
         working-directory: sentry-cli
