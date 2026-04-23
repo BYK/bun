@@ -1,21 +1,13 @@
-# Fork-only workflow verifying the Darwin /dev/tty fast-path fix for
-# `open_as_nonblocking_tty`. Runs on macos-14 (ARM64, native Apple Silicon).
+# Investigation workflow: determine WHERE the Darwin /dev/tty keystroke
+# delivery bug reproduces. Users on their desktop Macs report the bug
+# with Bun 1.3.11 (via sentry-cli's compiled binary). Initial run
+# against stock 1.3.13 on macos-14 (ARM64) did NOT reproduce. Matrix
+# below varies Bun version and runner OS to isolate the variable.
 #
-# Two jobs prove the fix:
-#
-#   1. stock-reproduces-bug  — downloads the official Bun 1.3.13 release
-#      binary and runs the new `stdin-fd0-macos-ctty.test.ts` regression
-#      test. Stock Bun should FAIL this test (the bug is present), so we
-#      invert the exit code: the job passes if the test fails.
-#
-#   2. patched-fixes-bug     — builds this fork from source with the
-#      patch applied and runs the same regression test. Patched Bun
-#      should PASS.
-#
-# Together they prove the patch turns a reproducible macOS failure into
-# a pass. The repo main-branch CI on the upstream PR will run the test
-# normally (without the inversion) against the build under review.
-name: Verify /dev/tty fast-path fix
+# For each matrix cell the harness exit code is reported as-is (no
+# inversion). A PASSING step ("got:590a") means the bug is NOT present.
+# A FAILING step (timeout, no "got:") means the bug IS reproducing.
+name: TTY bug repro matrix
 
 on:
   push:
@@ -24,38 +16,33 @@ on:
   workflow_dispatch:
 
 jobs:
-  stock-reproduces-bug:
-    name: Stock Bun 1.3.13 reproduces the bug on macOS
-    runs-on: macos-14
+  repro-matrix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-13]
+        bun: ["1.3.11", "1.3.12", "1.3.13"]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+    name: "bun ${{ matrix.bun }} on ${{ matrix.os }}"
     steps:
-      - name: Checkout (for the test file only)
-        uses: actions/checkout@v4
-
-      - name: Install Bun 1.3.13 (official release)
+      - name: Install Bun ${{ matrix.bun }}
         run: |
-          curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.13"
+          curl -fsSL https://bun.sh/install | bash -s "bun-v${{ matrix.bun }}"
           echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
 
-      - name: Confirm Bun version
-        run: bun --version
-
-      - name: Copy the test file into an isolated scratch dir
+      - name: Confirm Bun version + runner details
         run: |
-          mkdir -p /tmp/repro
-          cp test/regression/issue/stdin-fd0-macos-ctty.test.ts /tmp/repro/
+          bun --version
+          echo "---"
+          sw_vers
+          echo "---"
+          uname -a
 
-      - name: Run the regression harness directly (invert exit)
-        # The test body itself runs a Python PTY harness. We run the
-        # harness directly (bypassing `bun test`) because we want to
-        # observe stock Bun's hang — we want this step to FAIL if the
-        # harness reports keystroke delivery (no bug) and SUCCEED if it
-        # times out (bug present). Invert the exit code accordingly.
+      - name: Run the PTY harness (reports bug status)
         shell: bash
         run: |
           set +e
-          # Run the same harness that the regression test runs, but
-          # standalone so we can invert the meaning of its exit code.
           python3 <<'PY'
           import os, pty, sys, select, time, subprocess
 
@@ -64,6 +51,7 @@ jobs:
               capture_output=True, text=True, check=True
           ).stdout.strip()
 
+          os.makedirs("/tmp/repro", exist_ok=True)
           with open("/tmp/repro/child.js", "w") as f:
               f.write(
                   'process.stdout.write("ready\\n");\n'
@@ -108,79 +96,13 @@ jobs:
           harness_exit=$?
           set -e
 
+          echo "---"
           echo "Harness exit code: $harness_exit"
           if [ "$harness_exit" -eq 0 ]; then
-            echo "::error::Stock Bun 1.3.13 DELIVERED the keystroke — the bug is NOT reproducing on this runner. This invalidates the assumption the patch is fixing."
-            exit 1
+            echo "✓ Bug NOT reproducing on this matrix cell (keystroke delivered)"
           else
-            echo "✓ Stock Bun 1.3.13 failed to deliver the keystroke (expected — the bug is present without the patch)."
-            exit 0
+            echo "✗ Bug IS reproducing on this matrix cell (harness timed out)"
           fi
-
-  patched-fixes-bug:
-    name: Patched Bun passes the regression test on macOS
-    runs-on: macos-14
-    timeout-minutes: 60
-    steps:
-      - name: Checkout fork branch with patch
-        uses: actions/checkout@v4
-
-      - name: Verify the patch is in the checkout
-        run: |
-          if ! grep -q "Darwin fast-path: when \`fd\` is our controlling terminal" src/bun.js/bindings/c-bindings.cpp; then
-            echo "::error::The patch comment is not present in c-bindings.cpp. Did the branch get rebased?"
-            exit 1
-          fi
-          echo "✓ Patch found in c-bindings.cpp"
-
-      - name: Install build dependencies (Homebrew)
-        run: |
-          brew install automake ccache cmake coreutils gnu-sed go icu4c libiconv libtool ninja pkg-config rust ruby llvm@21
-
-      - name: Put LLVM 21 on PATH
-        run: |
-          echo "$(brew --prefix llvm@21)/bin" >> "$GITHUB_PATH"
-
-      - name: Install a stable Bun to drive the build
-        run: |
-          curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.13"
-          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
-
-      - name: Install Bun deps
-        run: bun install --frozen-lockfile
-
-      - name: Build Bun (release)
-        # Release build is what we distribute. Debug is faster to build
-        # but we want to verify the fix in the configuration users run.
-        run: bun run build:release
-        env:
-          CCACHE_DIR: ${{ github.workspace }}/.ccache
-
-      - name: Locate the built binary
-        id: locate
-        run: |
-          if [ -x "./build/release/bun" ]; then
-            echo "bun=./build/release/bun" >> "$GITHUB_OUTPUT"
-          elif [ -x "./build/debug/bun-debug" ]; then
-            echo "bun=./build/debug/bun-debug" >> "$GITHUB_OUTPUT"
-          else
-            echo "::error::No built Bun binary found"
-            ls -la build/ 2>&1 || true
-            exit 1
-          fi
-
-      - name: Confirm patched Bun version
-        run: |
-          ${{ steps.locate.outputs.bun }} --version
-          ${{ steps.locate.outputs.bun }} --revision || true
-
-      - name: Run the regression test against the patched build
-        env:
-          PATCHED_BUN: ${{ steps.locate.outputs.bun }}
-        run: |
-          # We use the patched Bun as the test runner AND as the child
-          # under test. A one-line shim sets bun to point at our build.
-          export PATH="$(dirname "$(realpath "$PATCHED_BUN")"):$PATH"
-          which bun
-          bun --version
-          bun test test/regression/issue/stdin-fd0-macos-ctty.test.ts
+          # Pass the exit code through so the step's status reflects the
+          # bug state: green = no bug, red = bug.
+          exit "$harness_exit"
