@@ -622,6 +622,51 @@ extern "C" int32_t open_as_nonblocking_tty(int32_t fd, int32_t mode)
         return -1;
     }
 
+#if OS(DARWIN)
+    // Darwin fast-path: when `fd` is our controlling terminal, open
+    // `/dev/tty` directly rather than the specific slave path returned
+    // by `ttyname_r`. This matters because XNU's `EVFILT_READ` kqueue
+    // filter on a pty-slave path, combined with `O_NOCTTY` in a
+    // non-session-leader process, does not reliably deliver read
+    // readiness notifications — the kernel accepts the `EV_ADD` but
+    // never fires events for the inherited fd. Opening `/dev/tty`
+    // instead routes through the kernel's cttydev lookup at open time,
+    // which produces an fd whose kqueue wiring works for typical
+    // controlling-terminal scenarios (confirmed by Bun's own regression
+    // test `test/regression/issue/tui-app-tty-pattern.test.ts`, which
+    // validates the `openSync("/dev/tty","r")` + `new tty.ReadStream`
+    // pattern that TUI apps currently use as a workaround).
+    //
+    // Observed symptom without this fast-path: compiled Bun binaries on
+    // macOS launched via `exec bin </dev/tty` (the standard `curl | bash`
+    // installer pattern) have `process.stdin` register `isTTY === true`
+    // and accept `setRawMode(true)`, but keystrokes never reach the
+    // `data` listener. Clack/Ink-style TUIs hang on their first prompt.
+    //
+    // See also:
+    //   - oven-sh/bun#24158 (confirmed bug, WriteStream side)
+    //   - oven-sh/bun#26792 (same root cause on Linux-RHEL8 equivalent)
+    //   - oven-sh/bun#26274 (prior attempt at a broader macOS kqueue
+    //     skip, closed due to test failures — this patch is narrower)
+    //   - https://nathancraddock.com/blog/macos-dev-tty-polling/
+    //     (kqueue on `/dev/tty` background)
+    //
+    // Guarded on `tcgetsid(fd) == getsid(0)` so we only take the fast
+    // path when `fd` IS our controlling terminal. Anything else (e.g.
+    // a pty master fd that happens to be redirected to our stdio) keeps
+    // the original `ttyname_r` behavior.
+    pid_t ttySid = tcgetsid(fd);
+    if (ttySid != -1 && ttySid == getsid(0)) {
+        int rc = open("/dev/tty", mode | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+        if (rc >= 0) {
+            return rc;
+        }
+        // Fall through to the ttyname_r path if /dev/tty open fails
+        // (daemonized process with no controlling terminal, sandbox,
+        // etc.).
+    }
+#endif
+
     char pathbuf[PATH_MAX + 1];
     if (ttyname_r(fd, pathbuf, sizeof(pathbuf)) != 0) {
         return -1;
