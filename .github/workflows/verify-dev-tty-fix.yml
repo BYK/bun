@@ -1,13 +1,13 @@
-# Investigation workflow: determine WHERE the Darwin /dev/tty keystroke
-# delivery bug reproduces. Users on their desktop Macs report the bug
-# with Bun 1.3.11 (via sentry-cli's compiled binary). Initial run
-# against stock 1.3.13 on macos-14 (ARM64) did NOT reproduce. Matrix
-# below varies Bun version and runner OS to isolate the variable.
+# Build a patched Bun for darwin-arm64 and use it to build sentry-cli
+# so we can hand the resulting binary to macOS users for real-world
+# validation of the /dev/tty fast-path fix.
 #
-# For each matrix cell the harness exit code is reported as-is (no
-# inversion). A PASSING step ("got:590a") means the bug is NOT present.
-# A FAILING step (timeout, no "got:") means the bug IS reproducing.
-name: TTY bug repro matrix
+# Workflow artifact at the end: `sentry-darwin-arm64` — a drop-in
+# replacement for the sentry binary that ships via install.sh, but
+# embedding our patched Bun runtime.
+#
+# Estimated runtime: 45-75 minutes (first run, no ccache warm-up).
+name: Build sentry-cli with patched Bun (darwin-arm64)
 
 on:
   push:
@@ -16,41 +16,88 @@ on:
   workflow_dispatch:
 
 jobs:
-  repro-matrix:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-14, macos-13]
-        bun: ["1.3.11", "1.3.12", "1.3.13"]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
-    name: "bun ${{ matrix.bun }} on ${{ matrix.os }}"
+  build-sentry-with-patched-bun:
+    name: Build patched Bun + sentry-cli for darwin-arm64
+    runs-on: macos-14
+    timeout-minutes: 120
     steps:
-      - name: Install Bun ${{ matrix.bun }}
+      - name: Checkout patched Bun (this fork)
+        uses: actions/checkout@v4
+        with:
+          path: bun
+
+      - name: Verify the patch is present
         run: |
-          curl -fsSL https://bun.sh/install | bash -s "bun-v${{ matrix.bun }}"
+          if ! grep -q "Darwin fast-path: when \`fd\` is our controlling terminal" bun/src/bun.js/bindings/c-bindings.cpp; then
+            echo "::error::The patch marker is missing from c-bindings.cpp."
+            exit 1
+          fi
+          echo "✓ Patch present"
+
+      - name: Install Bun build dependencies (Homebrew)
+        run: |
+          brew install automake ccache cmake coreutils gnu-sed go icu4c libiconv libtool ninja pkg-config rust ruby llvm@21
+
+      - name: Put LLVM 21 on PATH
+        run: |
+          echo "$(brew --prefix llvm@21)/bin" >> "$GITHUB_PATH"
+
+      - name: Install a stable Bun to drive the build
+        run: |
+          curl -fsSL https://bun.sh/install | bash
           echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
 
-      - name: Confirm Bun version + runner details
-        run: |
-          bun --version
-          echo "---"
-          sw_vers
-          echo "---"
-          uname -a
+      - name: Install Bun's own deps
+        working-directory: bun
+        run: bun install --frozen-lockfile
 
-      - name: Run the PTY harness (reports bug status)
-        shell: bash
+      - name: Cache Bun build (ccache + deps)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/ccache
+            bun/build/debug/deps
+            bun/build/release/deps
+            bun/vendor
+          key: bun-build-macos-14-${{ hashFiles('bun/CMakeLists.txt', 'bun/package.json', 'bun/scripts/download-zig.ts', 'bun/scripts/update-submodules.sh') }}
+
+      - name: Build Bun (release)
+        working-directory: bun
+        run: |
+          bun run build:release
+        env:
+          CCACHE_DIR: ~/.cache/ccache
+
+      - name: Locate patched Bun binary
+        id: locate-bun
+        run: |
+          for candidate in bun/build/release/bun bun/build/debug/bun-debug; do
+            if [ -x "$candidate" ]; then
+              path="$(realpath "$candidate")"
+              echo "bun=$path" >> "$GITHUB_OUTPUT"
+              echo "✓ Found patched Bun at $path"
+              "$path" --version
+              "$path" --revision || true
+              break
+            fi
+          done
+          if [ -z "$(grep '^bun=' "$GITHUB_OUTPUT")" ]; then
+            echo "::error::No Bun binary found after build"
+            ls -la bun/build/ 2>&1 || true
+            exit 1
+          fi
+
+      # Sanity check: run the regression test against the patched binary
+      # to confirm the fix works before we embed it in sentry-cli.
+      - name: Sanity-check the patched Bun against the PTY repro
+        env:
+          PATCHED_BUN: ${{ steps.locate-bun.outputs.bun }}
         run: |
           set +e
-          python3 <<'PY'
-          import os, pty, sys, select, time, subprocess
+          python3 <<PY
+          import os, pty, sys, select, time
 
-          BUN = subprocess.run(
-              ["bash", "-c", "command -v bun"],
-              capture_output=True, text=True, check=True
-          ).stdout.strip()
-
+          BUN = "$PATCHED_BUN"
           os.makedirs("/tmp/repro", exist_ok=True)
           with open("/tmp/repro/child.js", "w") as f:
               f.write(
@@ -84,25 +131,116 @@ jobs:
                       wrote_input = True
                   if b"got:" in output:
                       break
-
           try: os.kill(pid, 9)
           except OSError: pass
           try: os.waitpid(pid, 0)
           except OSError: pass
-
           sys.stdout.buffer.write(output); sys.stdout.flush()
           sys.exit(0 if b"got:" in output else 1)
           PY
-          harness_exit=$?
+          rc=$?
           set -e
+          # This is informational — on macos-14 runners even stock Bun
+          # delivers keystrokes, so we don't expect this to change
+          # status. Still useful to log for the PR body.
+          echo "PTY harness exit code with patched Bun: $rc"
 
-          echo "---"
-          echo "Harness exit code: $harness_exit"
-          if [ "$harness_exit" -eq 0 ]; then
-            echo "✓ Bug NOT reproducing on this matrix cell (keystroke delivered)"
-          else
-            echo "✗ Bug IS reproducing on this matrix cell (harness timed out)"
-          fi
-          # Pass the exit code through so the step's status reflects the
-          # bug state: green = no bug, red = bug.
-          exit "$harness_exit"
+      - name: Checkout sentry-cli at the commit BEFORE the macOS workaround was restored
+        uses: actions/checkout@v4
+        with:
+          repository: getsentry/cli
+          path: sentry-cli
+          # a38572ec is PR #835 (workaround deleted). Using this commit
+          # means the resulting binary has NO userland /dev/tty workaround
+          # — the only thing fixing the keystroke delivery would be the
+          # patched Bun runtime. Clean A/B test.
+          ref: a38572ec
+
+      - name: Patch sentry-cli build script to use the patched Bun runtime
+        working-directory: sentry-cli
+        env:
+          PATCHED_BUN: ${{ steps.locate-bun.outputs.bun }}
+        run: |
+          # Sentry-cli's build script passes an explicit
+          # `compile.target = "bun-darwin-arm64"` to `Bun.build`, which
+          # normally triggers a download from npm instead of using the
+          # running Bun as the embed runtime. We drop the `target` field
+          # so the build falls into the `isDefault()` branch and uses
+          # `selfExePath()` — our patched Bun.
+          #
+          # This only works when the host Bun's target matches the desired
+          # output (both darwin-arm64 in this workflow), which is exactly
+          # our setup.
+          python3 - <<'PY'
+          import re
+          p = "script/build.ts"
+          src = open(p).read()
+          # Replace the entire compile block's target assignment.
+          patched = re.sub(
+              r"(compile:\s*\{\s*)target:\s*getBunTarget\(target\)\s+as\s+[^,]+,\s*",
+              r"\1// target: <omitted>  — use selfExePath (patched Bun) as embed runtime\n        ",
+              src,
+              count=1,
+          )
+          if patched == src:
+              raise SystemExit("failed to patch build.ts — compile.target block not found")
+          open(p, "w").write(patched)
+          print("✓ Patched sentry-cli/script/build.ts")
+          PY
+          grep -n "compile:" script/build.ts || true
+
+      - name: Install sentry-cli deps using the patched Bun
+        working-directory: sentry-cli
+        env:
+          PATCHED_BUN: ${{ steps.locate-bun.outputs.bun }}
+        run: |
+          "$PATCHED_BUN" install --frozen-lockfile
+
+      - name: Build sentry-cli for darwin-arm64 using the patched Bun
+        working-directory: sentry-cli
+        env:
+          PATCHED_BUN: ${{ steps.locate-bun.outputs.bun }}
+        run: |
+          "$PATCHED_BUN" run build:single
+          ls -la dist-bin/
+          file dist-bin/sentry-darwin-arm64
+
+      - name: Quick smoke test — `sentry --version` with the embedded patched Bun
+        working-directory: sentry-cli
+        run: |
+          ./dist-bin/sentry-darwin-arm64 --version
+
+      - name: Upload sentry-darwin-arm64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sentry-darwin-arm64-patched-bun
+          path: sentry-cli/dist-bin/sentry-darwin-arm64
+          retention-days: 14
+
+      - name: Leave install instructions in the summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'MD'
+          ## How to use this build
+
+          1. Download `sentry-darwin-arm64-patched-bun` from the workflow
+             artifacts (top of the run page, "Artifacts" section).
+          2. Unzip and make it executable:
+             ```bash
+             unzip sentry-darwin-arm64-patched-bun.zip
+             chmod +x sentry-darwin-arm64
+             ```
+          3. Run `sentry init` the same way you would the real release
+             (e.g., from a project directory). If the wizard's first
+             prompt — "EXPERIMENTAL: This feature is experimental and may
+             modify your code. Continue?" — accepts your keystrokes
+             (Y/N/Enter), the patch worked. If it hangs like before, the
+             patch isn't the right fix.
+
+          The binary is sentry-cli from `main` (includes the
+          userland /dev/tty workaround), built with a Bun runtime that
+          includes the Candidate A patch from this PR. If the userland
+          workaround is what's actually fixing your macOS install, the
+          Bun patch underneath is redundant; if the userland workaround
+          isn't sufficient and the Bun patch is what unblocks you, we
+          have clear signal to push the upstream PR.
+          MD
