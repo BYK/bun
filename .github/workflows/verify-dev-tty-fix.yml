@@ -202,6 +202,14 @@ jobs:
         working-directory: sentry-cli
         env:
           PATCHED_BUN: ${{ steps.locate-bun.outputs.bun }}
+          # sentry-cli's build injects a Sentry OAuth client ID at compile
+          # time. We don't actually use OAuth in this test binary (the
+          # friend is only exercising `sentry init`), but a value is
+          # required for the build to complete. A dummy non-OAuth value
+          # is fine — any OAuth attempt will fail with an unauthorized
+          # error, but the wizard's keystroke-delivery test doesn't
+          # exercise that path.
+          SENTRY_CLIENT_ID: "ci-darwin-patch-validation"
         run: |
           # sentry-cli's package.json uses `"build"` (not `build:single`)
           # to invoke the single-target build via `script/build.ts --single`.
